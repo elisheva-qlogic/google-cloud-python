@@ -55,6 +55,7 @@ class Session(object):
     _transaction = None
 
     def __init__(self, database, labels=None):
+        self._attempts = 0
         self._database = database
         if labels is None:
             labels = {}
@@ -258,6 +259,7 @@ class Session(object):
             del self._transaction
 
         txn = self._transaction = Transaction(self)
+        self._attempts += 1
         return txn
 
     def run_in_transaction(self, func, *args, **kw):
@@ -295,7 +297,7 @@ class Session(object):
                 return_value = func(txn, *args, **kw)
             except Aborted as exc:
                 del self._transaction
-                _delay_until_retry(exc, deadline)
+                _delay_until_retry(exc, deadline, self._attempts)
                 continue
             except GoogleAPICallError:
                 del self._transaction
@@ -308,7 +310,7 @@ class Session(object):
                 txn.commit()
             except Aborted as exc:
                 del self._transaction
-                _delay_until_retry(exc, deadline)
+                _delay_until_retry(exc, deadline, self._attempts)
             except GoogleAPICallError:
                 del self._transaction
                 raise
@@ -320,7 +322,7 @@ class Session(object):
 #
 # Rational:  this function factors out complex shared deadline / retry
 #            handling from two `except:` clauses.
-def _delay_until_retry(exc, deadline):
+def _delay_until_retry(exc, deadline, attempts):
     """Helper for :meth:`Session.run_in_transaction`.
 
     Detect retryable abort, and impose server-supplied delay.
@@ -338,7 +340,7 @@ def _delay_until_retry(exc, deadline):
     if now >= deadline:
         raise
 
-    delay = _get_retry_delay(cause)
+    delay = _get_retry_delay(cause, attempts)
     if delay is not None:
 
         if now + delay > deadline:
@@ -350,11 +352,14 @@ def _delay_until_retry(exc, deadline):
 # pylint: enable=misplaced-bare-raise
 
 
-def _get_retry_delay(cause):
+def _get_retry_delay(cause, attempts):
     """Helper for :func:`_delay_until_retry`.
 
     :type exc: :class:`grpc.Call`
     :param exc: exception for aborted transaction
+
+    :type exc:
+    :param exc: Number of attempts made, used for generating backoff when retry info is absent.
 
     :rtype: float
     :returns: seconds to wait before retrying the transaction.
@@ -366,3 +371,7 @@ def _get_retry_delay(cause):
         retry_info.ParseFromString(retry_info_pb)
         nanos = retry_info.retry_delay.nanos
         return retry_info.retry_delay.seconds + nanos / 1.0e9
+    else:
+        import math
+        from random import random
+        return math.pow(2, attempts) * 1000 + math.floor(random() * 1000)
